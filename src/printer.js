@@ -17,6 +17,7 @@ var group = docBuilders.group;
 var indent = docBuilders.indent;
 var align = docBuilders.align;
 var conditionalGroup = docBuilders.conditionalGroup;
+var fill = docBuilders.fill;
 var ifBreak = docBuilders.ifBreak;
 var breakParent = docBuilders.breakParent;
 var lineSuffixBoundary = docBuilders.lineSuffixBoundary;
@@ -26,10 +27,9 @@ var willBreak = docUtils.willBreak;
 var isLineNext = docUtils.isLineNext;
 var isEmpty = docUtils.isEmpty;
 
-var types = require("ast-types");
+var types = require("./ast-types");
 var namedTypes = types.namedTypes;
 var isString = types.builtInTypes.string;
-var isObject = types.builtInTypes.object;
 
 function shouldPrintComma(options, level) {
   level = level || "es5";
@@ -182,6 +182,17 @@ function genericPrintNoParens(path, options, print, args) {
     case "EmptyStatement":
       return "";
     case "ExpressionStatement":
+      // Detect Flow-parsed directives
+      if (n.directive) {
+        return concat([
+          nodeStr(
+            n.expression,
+            options,
+            true
+          ),
+          semi
+        ]);
+      }
       return concat([path.call(print, "expression"), semi]); // Babel extension.
     case "ParenthesizedExpression":
       return concat(["(", path.call(print, "expression"), ")"]);
@@ -197,6 +208,7 @@ function genericPrintNoParens(path, options, print, args) {
     case "BinaryExpression":
     case "LogicalExpression": {
       const parent = path.getParentNode();
+      const parentParent = path.getParentNode(1);
       const isInsideParenthesis =
         n !== parent.body &&
         (parent.type === "IfStatement" ||
@@ -231,6 +243,8 @@ function genericPrintNoParens(path, options, print, args) {
         parent.type === "VariableDeclarator" ||
         shouldInlineLogicalExpression(n) ||
         parent.type === "ReturnStatement" ||
+        (parent.type === "JSXExpressionContainer" &&
+          parentParent.type === "JSXAttribute") ||
         (n === parent.body && parent.type === "ArrowFunctionExpression") ||
         (n !== parent.body && parent.type === "ForStatement")
       ) {
@@ -254,6 +268,13 @@ function genericPrintNoParens(path, options, print, args) {
         path.call(print, "left"),
         " = ",
         path.call(print, "right")
+      ]);
+    case "TSTypeAssertionExpression":
+      return concat([
+        "<",
+        path.call(print, "typeAnnotation"),
+        ">",
+        path.call(print, "expression")
       ]);
     case "MemberExpression": {
       const parent = path.getParentNode();
@@ -307,10 +328,10 @@ function genericPrintNoParens(path, options, print, args) {
       return join(".", n.body);
     case "Identifier":
       var parentNode = path.getParentNode()
-      var isFunctionDeclarationIdentifier = 
+      var isFunctionDeclarationIdentifier =
         parentNode.type === 'DeclareFunction' &&
         parentNode.id === n
-          
+
       return concat([
         n.name,
         n.optional ? "?" : "",
@@ -333,13 +354,18 @@ function genericPrintNoParens(path, options, print, args) {
       ]);
     case "FunctionDeclaration":
     case "FunctionExpression":
-      return printFunctionDeclaration(path, print, options);
-    case "ArrowFunctionExpression": {
-      if (n.async) parts.push("async ");
-
-      if (n.typeParameters) {
-        parts.push(path.call(print, "typeParameters"));
+    case "TSNamespaceFunctionDeclaration":
+      if (isNodeStartingWithDeclare(n, options)) {
+        parts.push("declare ");
       }
+      parts.push(printFunctionDeclaration(path, print, options));
+      return concat(parts);
+    case "ArrowFunctionExpression": {
+      if (n.async) {
+        parts.push("async ");
+      }
+
+      parts.push(printFunctionTypeParameters(path, options, print));
 
       if (canPrintParamsWithoutParens(n)) {
         parts.push(path.call(print, "params", 0));
@@ -371,9 +397,7 @@ function genericPrintNoParens(path, options, print, args) {
         n.body.type === "ObjectExpression" ||
         n.body.type === "JSXElement" ||
         n.body.type === "BlockStatement" ||
-        n.body.type === "TaggedTemplateExpression" ||
-        n.body.type === "TemplateElement" ||
-        n.body.type === "ClassExpression" ||
+        isTemplateOnItsOwnLine(n.body, options.originalText) ||
         n.body.type === "ArrowFunctionExpression"
       ) {
         return group(collapsed);
@@ -384,12 +408,29 @@ function genericPrintNoParens(path, options, print, args) {
       // with the opening (.
       const shouldAddSoftLine = args && args.expandLastArg;
 
+      // In order to avoid confusion between
+      // a => a ? a : a
+      // a <= a ? a : a
+      const shouldAddParens =
+        n.body.type === "ConditionalExpression" &&
+        !util.startsWithNoLookaheadToken(
+          n.body,
+          /* forbidFunctionAndClass */ false
+        );
+
       return group(
         concat([
           concat(parts),
           group(
             concat([
-              indent(concat([line, body])),
+              indent(
+                concat([
+                  line,
+                  shouldAddParens ? ifBreak("", "(") : "",
+                  body,
+                  shouldAddParens ? ifBreak("", ")") : ""
+                ])
+              ),
               shouldAddSoftLine
                 ? concat([
                     ifBreak(shouldPrintComma(options, "all") ? "," : ""),
@@ -402,8 +443,15 @@ function genericPrintNoParens(path, options, print, args) {
       );
     }
     case "MethodDefinition":
+    case "TSAbstractMethodDefinition":
       if (n.static) {
         parts.push("static ");
+      }
+      if (n.accessibility) {
+        parts.push(n.accessibility + " ");
+      }
+      if (n.type === "TSAbstractMethodDefinition") {
+        parts.push("abstract ");
       }
 
       parts.push(printMethod(path, options, print));
@@ -412,17 +460,23 @@ function genericPrintNoParens(path, options, print, args) {
     case "YieldExpression":
       parts.push("yield");
 
-      if (n.delegate) parts.push("*");
-
-      if (n.argument) parts.push(" ", path.call(print, "argument"));
+      if (n.delegate) {
+        parts.push("*");
+      }
+      if (n.argument) {
+        parts.push(" ", path.call(print, "argument"));
+      }
 
       return concat(parts);
     case "AwaitExpression":
       parts.push("await");
 
-      if (n.all) parts.push("*");
-
-      if (n.argument) parts.push(" ", path.call(print, "argument"));
+      if (n.all) {
+        parts.push("*");
+      }
+      if (n.argument) {
+        parts.push(" ", path.call(print, "argument"));
+      }
 
       return concat(parts);
     case "ModuleDeclaration":
@@ -656,11 +710,7 @@ function genericPrintNoParens(path, options, print, args) {
         }
       }
 
-      const hasDanglingComments =
-        n.comments &&
-        n.comments.some(comment => !comment.leading && !comment.trailing);
-
-      if (hasDanglingComments) {
+      if (hasDanglingComments(n)) {
         parts.push(
           " ",
           comments.printDanglingComments(path, options, /* sameIndent */ true)
@@ -674,6 +724,9 @@ function genericPrintNoParens(path, options, print, args) {
       if (
         // We want to keep require calls as a unit
         (n.callee.type === "Identifier" && n.callee.name === "require") ||
+        // Template literals as single arguments
+        (n.arguments.length === 1 &&
+          isTemplateOnItsOwnLine(n.arguments[0], options.originalText)) ||
         // Keep test declarations on a single line
         // e.g. `it('long name', () => {`
         (n.callee.type === "Identifier" &&
@@ -704,59 +757,160 @@ function genericPrintNoParens(path, options, print, args) {
 
       return concat([
         path.call(print, "callee"),
-        path.call(print, "typeParameters"),
+        printFunctionTypeParameters(path, options, print),
         printArgumentsList(path, options, print)
       ]);
     }
-
+    case "TSInterfaceDeclaration":
+      parts.push(
+        printTypeScriptModifiers(path, options, print),
+        "interface ",
+        path.call(print, "id"),
+        n.typeParameters ? path.call(print, "typeParameters") : "",
+        " "
+      );
+      
+      if (n.heritage.length) {
+        parts.push(
+          "extends ",
+          join(", ", path.map(print, "heritage")),
+          " "
+        );
+      }
+      
+      parts.push(path.call(print, "body"));
+      
+      return concat(parts);
     case "ObjectExpression":
     case "ObjectPattern":
+    case "TSInterfaceBody":
     case "ObjectTypeAnnotation":
-    case "TSTypeLiteral":
+    case "TSTypeLiteral": {
       var isTypeAnnotation = n.type === "ObjectTypeAnnotation";
-      var isTypeScriptTypeAnnotaion = n.type === "TSTypeLiteral";
+      var isTypeScriptTypeAnnotation = n.type === "TSTypeLiteral";
+      var isTypeScriptInterfaceBody = n.type === "TSInterfaceBody";
+      var isTypeScriptType = isTypeScriptTypeAnnotation || isTypeScriptInterfaceBody;
       // Leave this here because we *might* want to make this
       // configurable later -- flow accepts ";" for type separators,
       // typescript accepts ";" and newlines
       var separator = isTypeAnnotation ? "," : ",";
+      if (isTypeScriptInterfaceBody) {
+        separator = semi;
+      }
       var fields = [];
+      var prefix = [];
       var leftBrace = n.exact ? "{|" : "{";
       var rightBrace = n.exact ? "|}" : "}";
       var parent = path.getParentNode(0);
       var parentIsUnionTypeAnnotation = parent.type === "UnionTypeAnnotation";
-      var propertiesField = isTypeScriptTypeAnnotaion
-        ? "members"
-        : "properties";
+      var propertiesField;
+      
+      if (n.type === 'TSTypeLiteral') {
+        propertiesField = "members";
+      } else if (n.type === "TSInterfaceBody") {
+        propertiesField = "body";
+      } else {
+        propertiesField = "properties";
+      }
 
       if (isTypeAnnotation) {
         fields.push("indexers", "callProperties");
       }
-
       fields.push(propertiesField);
 
-      var props = [];
-      let separatorParts = [];
-
+      // Unfortunately, things are grouped together in the ast can be
+      // interleaved in the source code. So we need to reorder them before
+      // printing them.
+      const propsAndLoc = [];
       fields.forEach(function(field) {
         path.each(function(childPath) {
-          props.push(concat(separatorParts));
-          props.push(group(print(childPath)));
-
-          separatorParts = [separator, line];
-          if (
-            util.isNextLineEmpty(options.originalText, childPath.getValue())
-          ) {
-            separatorParts.push(hardline);
-          }
+          const node = childPath.getValue();
+          propsAndLoc.push({
+            node: node,
+            printed: print(childPath),
+            loc: util.locStart(node)
+          });
         }, field);
       });
 
+      let separatorParts = [];
+      const props = propsAndLoc
+        .sort((a, b) => a.loc - b.loc)
+        .map(prop => {
+          const result = concat(separatorParts.concat(group(prop.printed)));
+          separatorParts = [separator, line];
+          if (
+            util.isNextLineEmpty(options.originalText, prop.node)
+          ) {
+            separatorParts.push(hardline);
+          }
+          return result;
+        });
+
       const lastElem = util.getLast(n[propertiesField]);
 
-      const canHaveTrailingComma = !(
+      const canHaveTrailingSeparator = !(
         lastElem &&
         (lastElem.type === "RestProperty" || lastElem.type === "RestElement")
       );
+
+      let content;
+      if (props.length === 0 && !n.typeAnnotation) {
+        if (!hasDanglingComments(n)) {
+          return concat([leftBrace, rightBrace]);
+        }
+
+        content = group(
+          concat([
+            leftBrace,
+            comments.printDanglingComments(path, options),
+            softline,
+            rightBrace
+          ])
+        );
+      } else {
+        content = concat([
+          leftBrace,
+          indent(
+            align(
+              parentIsUnionTypeAnnotation ? 2 : 0,
+              concat([
+                options.bracketSpacing ? line : softline,
+                concat(props)
+              ])
+            )
+          ),
+          ifBreak(
+            canHaveTrailingSeparator &&
+              (separator !== "," || shouldPrintComma(options))
+                ? separator
+                : ""
+          ),
+          align(
+            parentIsUnionTypeAnnotation ? 2 : 0,
+            concat([options.bracketSpacing ? line : softline, rightBrace])
+          ),
+          n.typeAnnotation ? ": " : "",
+          path.call(print, "typeAnnotation")
+        ]);
+      }
+
+      // If we inline the object as first argument of the parent, we don't want
+      // to create another group so that the object breaks before the return
+      // type
+      const parentParentParent = path.getParentNode(2);
+      if (
+        (n.type === "ObjectPattern" &&
+          parent &&
+          shouldHugArguments(parent) &&
+          parent.params[0] === n) ||
+        (n.type === "ObjectTypeAnnotation" &&
+          parentParentParent &&
+          shouldHugArguments(parentParentParent) &&
+          parentParentParent.params[0].typeAnnotation.typeAnnotation === n)
+      ) {
+        return content;
+      }
 
       const shouldBreak =
         n.type !== "ObjectPattern" &&
@@ -766,42 +920,8 @@ function genericPrintNoParens(path, options, print, args) {
           util.locEnd(n)
         );
 
-      if (props.length === 0) {
-        return group(
-          concat([
-            leftBrace,
-            comments.printDanglingComments(path, options),
-            softline,
-            rightBrace
-          ])
-        );
-      } else {
-        return group(
-          concat([
-            leftBrace,
-            indent(
-              align(
-                parentIsUnionTypeAnnotation ? 2 : 0,
-                concat([
-                  options.bracketSpacing ? line : softline,
-                  concat(props)
-                ])
-              )
-            ),
-            ifBreak(
-              canHaveTrailingComma && shouldPrintComma(options) ? "," : ""
-            ),
-            align(
-              parentIsUnionTypeAnnotation ? 2 : 0,
-              concat([options.bracketSpacing ? line : softline, rightBrace])
-            ),
-            n.typeAnnotation ? ": " : "",
-            path.call(print, "typeAnnotation")
-          ]),
-          { shouldBreak }
-        );
-      }
-
+      return group(content, { shouldBreak });
+    }
     case "PropertyPattern":
       return concat([
         path.call(print, "key"),
@@ -837,21 +957,26 @@ function genericPrintNoParens(path, options, print, args) {
       return concat(parts); // Babel 6
     case "ObjectMethod":
       return printObjectMethod(path, options, print);
+    case "TSDecorator":
     case "Decorator":
       return concat(["@", path.call(print, "expression")]);
     case "ArrayExpression":
     case "ArrayPattern":
       if (n.elements.length === 0) {
-        parts.push(
-          group(
-            concat([
-              "[",
-              comments.printDanglingComments(path, options),
-              softline,
-              "]"
-            ])
-          )
-        );
+        if (!hasDanglingComments(n)) {
+          parts.push("[]");
+        } else {
+          parts.push(
+            group(
+              concat([
+                "[",
+                comments.printDanglingComments(path, options),
+                softline,
+                "]"
+              ])
+            )
+          );
+        }
       } else {
         const lastElem = util.getLast(n.elements);
         const canHaveTrailingComma = !(lastElem &&
@@ -900,7 +1025,9 @@ function genericPrintNoParens(path, options, print, args) {
         );
       }
 
-      if (n.typeAnnotation) parts.push(": ", path.call(print, "typeAnnotation"));
+      if (n.typeAnnotation) {
+        parts.push(": ", path.call(print, "typeAnnotation"));
+      }
 
       return concat(parts);
     case "SequenceExpression":
@@ -923,10 +1050,15 @@ function genericPrintNoParens(path, options, print, args) {
     // Babel 6 Literal split
     case "StringLiteral":
     case "Literal":
-      if (typeof n.value === "number") return printNumber(n.raw);
-      if (n.regex) return printRegex(n.regex);
-      if (typeof n.value !== "string") return "" + n.value;
-
+      if (n.regex) {
+        return printRegex(n.regex);
+      }
+      if (typeof n.value === "number") {
+        return printNumber(n.raw);
+      }
+      if (typeof n.value !== "string") {
+        return "" + n.value;
+      }
       return nodeStr(n, options); // Babel 6
     case "Directive":
       return path.call(print, "value"); // Babel 6
@@ -943,7 +1075,9 @@ function genericPrintNoParens(path, options, print, args) {
     case "UnaryExpression":
       parts.push(n.operator);
 
-      if (/[a-z]$/.test(n.operator)) parts.push(" ");
+      if (/[a-z]$/.test(n.operator)) {
+        parts.push(" ");
+      }
 
       parts.push(path.call(print, "argument"));
 
@@ -951,7 +1085,9 @@ function genericPrintNoParens(path, options, print, args) {
     case "UpdateExpression":
       parts.push(path.call(print, "argument"), n.operator);
 
-      if (n.prefix) parts.reverse();
+      if (n.prefix) {
+        parts.reverse();
+      }
 
       return concat(parts);
     case "ConditionalExpression":
@@ -962,7 +1098,9 @@ function genericPrintNoParens(path, options, print, args) {
             concat([
               line,
               "? ",
+              n.consequent.type === "ConditionalExpression" ? ifBreak("", "(") : "",
               align(2, path.call(print, "consequent")),
+              n.consequent.type === "ConditionalExpression" ? ifBreak("", ")") : "",
               line,
               ": ",
               align(2, path.call(print, "alternate"))
@@ -971,15 +1109,13 @@ function genericPrintNoParens(path, options, print, args) {
         ])
       );
     case "NewExpression":
-      parts.push("new ", path.call(print, "callee"));
+      parts.push(
+        "new ",
+        path.call(print, "callee"),
+        printFunctionTypeParameters(path, options, print)
+      );
 
-      if (n.typeParameters) {
-        parts.push(path.call(print, "typeParameters"));
-      }
-
-      var args = n.arguments;
-
-      if (args) {
+      if (n.arguments) {
         parts.push(printArgumentsList(path, options, print));
       }
 
@@ -990,6 +1126,7 @@ function genericPrintNoParens(path, options, print, args) {
       }, "declarations");
 
       parts = [
+        isNodeStartingWithDeclare(n, options) ? "declare " : "",
         n.kind,
         " ",
         printed[0],
@@ -1016,19 +1153,19 @@ function genericPrintNoParens(path, options, print, args) {
     case "VariableDeclarator":
       return printAssignment(
         n.id,
-        path.call(print, "id"),
+        concat([path.call(print, "id"), path.call(print, "typeParameters")]),
         "=",
         n.init,
         n.init && path.call(print, "init"),
         options
       );
     case "WithStatement":
-      return concat([
+      return group(concat([
         "with (",
         path.call(print, "object"),
         ")",
         adjustClause(n.body, path.call(print, "body"))
-      ]);
+      ]));
     case "IfStatement":
       const con = adjustClause(n.consequent, path.call(print, "consequent"));
       const opening = group(
@@ -1080,35 +1217,37 @@ function genericPrintNoParens(path, options, print, args) {
       const printedComments = dangling ? concat([dangling, softline]) : "";
 
       if (!n.init && !n.test && !n.update) {
-        return concat([printedComments, "for (;;)", body]);
+        return concat([printedComments, group(concat(["for (;;)", body]))]);
       }
 
       return concat([
         printedComments,
-        "for (",
-        group(
-          concat([
-            indent(
-              concat([
-                softline,
-                path.call(print, "init"),
-                ";",
-                line,
-                path.call(print, "test"),
-                ";",
-                line,
-                path.call(print, "update")
-              ])
-            ),
-            softline
-          ])
-        ),
-        ")",
-        body
+        group(concat([
+          "for (",
+          group(
+            concat([
+              indent(
+                concat([
+                  softline,
+                  path.call(print, "init"),
+                  ";",
+                  line,
+                  path.call(print, "test"),
+                  ";",
+                  line,
+                  path.call(print, "update")
+                ])
+              ),
+              softline
+            ])
+          ),
+          ")",
+          body
+        ]))
       ]);
     }
     case "WhileStatement":
-      return concat([
+      return group(concat([
         "while (",
         group(
           concat([
@@ -1118,17 +1257,17 @@ function genericPrintNoParens(path, options, print, args) {
         ),
         ")",
         adjustClause(n.body, path.call(print, "body"))
-      ]);
+      ]));
     case "ForInStatement":
       // Note: esprima can't actually parse "for each (".
-      return concat([
+      return group(concat([
         n.each ? "for each (" : "for (",
         path.call(print, "left"),
         " in ",
         path.call(print, "right"),
         ")",
         adjustClause(n.body, path.call(print, "body"))
-      ]);
+      ]));
 
     case "ForOfStatement":
     case "ForAwaitStatement":
@@ -1137,7 +1276,7 @@ function genericPrintNoParens(path, options, print, args) {
       // https://github.com/estree/estree/pull/138
       const isAwait = n.type === "ForAwaitStatement" || n.await;
 
-      return concat([
+      return group(concat([
         "for",
         isAwait ? " await" : "",
         " (",
@@ -1146,11 +1285,11 @@ function genericPrintNoParens(path, options, print, args) {
         path.call(print, "right"),
         ")",
         adjustClause(n.body, path.call(print, "body"))
-      ]);
+      ]));
 
     case "DoWhileStatement":
       var clause = adjustClause(n.body, path.call(print, "body"));
-      var doBody = concat(["do", clause]);
+      var doBody = group(concat(["do", clause]));
       var parts = [doBody];
 
       if (n.body.type === "BlockStatement") {
@@ -1173,7 +1312,9 @@ function genericPrintNoParens(path, options, print, args) {
     case "BreakStatement":
       parts.push("break");
 
-      if (n.label) parts.push(" ", path.call(print, "label"));
+      if (n.label) {
+        parts.push(" ", path.call(print, "label"));
+      }
 
       parts.push(semi);
 
@@ -1181,7 +1322,9 @@ function genericPrintNoParens(path, options, print, args) {
     case "ContinueStatement":
       parts.push("continue");
 
-      if (n.label) parts.push(" ", path.call(print, "label"));
+      if (n.label) {
+        parts.push(" ", path.call(print, "label"));
+      }
 
       parts.push(semi);
 
@@ -1237,8 +1380,11 @@ function genericPrintNoParens(path, options, print, args) {
         "}"
       ]);
     case "SwitchCase":
-      if (n.test) parts.push("case ", path.call(print, "test"), ":");
-      else parts.push("default:");
+      if (n.test) {
+        parts.push("case ", path.call(print, "test"), ":");
+      } else {
+        parts.push("default:");
+      }
 
       const isFirstCase = path.getNode() === path.getParentNode().cases[0];
 
@@ -1287,10 +1433,7 @@ function genericPrintNoParens(path, options, print, args) {
           typeof n.value.value === "string"
         ) {
           const value = n.value.extra ? n.value.extra.raw : n.value.raw;
-          res =
-            '"' +
-            value.slice(1, value.length - 1).replace(/"/g, "&quot;") +
-            '"';
+          res = '"' + value.slice(1, -1).replace(/"/g, "&quot;") + '"';
         } else {
           res = path.call(print, "value");
         }
@@ -1299,6 +1442,14 @@ function genericPrintNoParens(path, options, print, args) {
 
       return concat(parts);
     case "JSXIdentifier":
+      // Can be removed when this is fixed:
+      // https://github.com/eslint/typescript-eslint-parser/issues/257
+      if (n.object && n.property) {
+        return join(".", [
+          path.call(print, "object"),
+          path.call(print, "property")
+        ]);
+      }
       return "" + n.name;
     case "JSXNamespacedName":
       return join(":", [
@@ -1391,9 +1542,7 @@ function genericPrintNoParens(path, options, print, args) {
     case "JSXText":
       throw new Error("JSXTest should be handled by JSXElement");
     case "JSXEmptyExpression":
-      const requiresHardline = n.comments && n.comments.some(
-        comment => comment.type === "Line" || comment.type === "CommentLine"
-      );
+      const requiresHardline = n.comments && !n.comments.every(util.isBlockComment);
 
       return concat([
         comments.printDanglingComments(
@@ -1432,46 +1581,60 @@ function genericPrintNoParens(path, options, print, args) {
     case "ClassPropertyDefinition":
       parts.push("static ", path.call(print, "definition"));
 
-      if (!namedTypes.MethodDefinition.check(n.definition)) parts.push(semi);
+      if (!namedTypes.MethodDefinition.check(n.definition)) {
+        parts.push(semi);
+      }
 
       return concat(parts);
     case "ClassProperty":
-      if (n.static) parts.push("static ");
-
-      var key;
-
-      if (n.computed) {
-        key = concat(["[", path.call(print, "key"), "]"]);
-      } else {
-        key = printPropertyKey(path, options, print);
-
-        var variance = getFlowVariance(n, options);
-
-        if (variance) {
-          key = concat([variance, key]);
-        } else if (n.accessibility === "public") {
-          key = concat(["public ", key]);
-        } else if (n.accessibility === "protected") {
-          key = concat(["protected ", key]);
-        } else if (n.accessibility === "private") {
-          key = concat(["private ", key]);
-        }
+    case "TSAbstractClassProperty":
+      if (n.static) {
+        parts.push("static ");
       }
-
-      parts.push(key);
-
-      if (n.typeAnnotation) parts.push(": ", path.call(print, "typeAnnotation"));
-
-      if (n.value) parts.push(" = ", path.call(print, "value"));
+      var variance = getFlowVariance(n, options);
+      if (variance) {
+        parts.push(variance);
+      }
+      if (n.accessibility) {
+        parts.push(n.accessibility + " ");
+      }
+      if (n.type === "TSAbstractClassProperty") {
+        parts.push("abstract ");
+      }
+      if (n.computed) {
+        parts.push("[", path.call(print, "key"), "]");
+      } else {
+        parts.push(printPropertyKey(path, options, print));
+      }
+      if (n.typeAnnotation) {
+        parts.push(": ", path.call(print, "typeAnnotation"));
+      }
+      if (n.value) {
+        parts.push(" = ", path.call(print, "value"));
+      }
 
       parts.push(semi);
 
       return concat(parts);
     case "ClassDeclaration":
     case "ClassExpression":
-      return concat(printClass(path, options, print));
+    case "TSAbstractClassDeclaration":
+      if (isNodeStartingWithDeclare(n, options)) {
+        parts.push("declare ");
+      }
+      parts.push(concat(printClass(path, options, print)));
+      return concat(parts);
+    case "TSInterfaceHeritage":
+      return path.call(print, "id");
+    case "TSHeritageClause":
+      return join(", ", path.map(print, "types"));
+    case "TSExpressionWithTypeArguments":
+      return concat([
+        path.call(print, "expression"),
+        printTypeParameters(path, options, print, "typeArguments")
+      ]);
     case "TemplateElement":
-      return join(literalline, n.value.raw.split("\n"));
+      return join(literalline, n.value.raw.split(/\r?\n/g));
     case "TemplateLiteral":
       var expressions = path.map(print, "expressions");
 
@@ -1483,9 +1646,51 @@ function genericPrintNoParens(path, options, print, args) {
         parts.push(print(childPath));
 
         if (i < expressions.length) {
+          // For a template literal of the following form:
+          //   `someQuery {
+          //     ${call({
+          //       a,
+          //       b,
+          //     })}
+          //   }`
+          // the expression is on its own line (there is a \n in the previous
+          // quasi literal), therefore we want to indent the JavaScript
+          // expression inside at the beginning of ${ instead of the beginning
+          // of the `.
+          let size = 0;
+          const value = childPath.getValue().value.raw;
+          const index = value.lastIndexOf('\n');
+          const tabWidth = options.tabWidth;
+          if (index !== -1) {
+            for (let i = index + 1; i < value.length; ++i) {
+              if (value[i] === '\t') {
+                // Tabs behave in a way that they are aligned to the nearest
+                // multiple of tabWidth:
+                // 0 -> 4, 1 -> 4, 2 -> 4, 3 -> 4
+                // 4 -> 8, 5 -> 8, 6 -> 8, 7 -> 8 ...
+                size = size + tabWidth - size % tabWidth;
+              } else {
+                size++;
+              }
+            }
+          }
+
+          let aligned = removeLines(expressions[i]);
+          if (size > 0) {
+            // Use indent to add tabs for all the levels of tabs we need
+            for (var i = 0; i < Math.floor(size / tabWidth); ++i) {
+              aligned = indent(aligned);
+            }
+            // Use align for all the spaces that are needed
+            aligned = align(size % tabWidth, aligned);
+            // size is absolute from 0 and not relative to the current
+            // indentation, so we use -Infinity to reset the indentation to 0
+            aligned = align(-Infinity, aligned);
+          }
+
           parts.push(
             "${",
-            removeLines(expressions[i]),
+            aligned,
             lineSuffixBoundary,
             "}"
           );
@@ -1632,19 +1837,10 @@ function genericPrintNoParens(path, options, print, args) {
         parts.push("(");
       }
 
-      // With TypeScript `typeParameters` is an array of `TSTypeParameter` and
-      // with flow they are one `TypeParameterDeclaration` node.
-      if (n.type === 'TSFunctionType' && n.typeParameters) {
-        parts.push(
-          "<",
-          join(", ", path.map(print, "typeParameters")),
-          ">"
-        )
-      } else {
-        parts.push(path.call(print, "typeParameters"));
-      }
-
-      parts.push(printFunctionParams(path, print, options));
+      parts.push(
+        printFunctionTypeParameters(path, options, print),
+        printFunctionParams(path, print, options)
+      );
 
       // The returnType is not wrapped in a TypeAnnotation, so the colon
       // needs to be added separately.
@@ -1677,7 +1873,7 @@ function genericPrintNoParens(path, options, print, args) {
     case "InterfaceDeclaration": {
       if (
         n.type === "DeclareInterface" ||
-        isFlowNodeStartingWithDeclare(n, options)
+        isNodeStartingWithDeclare(n, options)
       ) {
         parts.push("declare ");
       }
@@ -1741,8 +1937,11 @@ function genericPrintNoParens(path, options, print, args) {
 
       const parent = path.getParentNode();
       // If there's a leading comment, the parent is doing the indentation
-      const shouldIndent = !(parent.type === "TypeAlias" &&
-        hasLeadingOwnLineComment(options.originalText, n));
+      const shouldIndent = (
+        parent.type !== "TypeParameterInstantiation" &&
+        !(parent.type === "TypeAlias" &&
+          hasLeadingOwnLineComment(options.originalText, n))
+      );
 
       //const token = isIntersection ? "&" : "|";
       const code = concat([
@@ -1781,17 +1980,14 @@ function genericPrintNoParens(path, options, print, args) {
       ]);
     case "ObjectTypeProperty":
       var variance = getFlowVariance(n, options);
-      // TODO: This is a bad hack and we need a better way to know
-      // when to emit an arrow function or not.
-      var isFunctionNotation = util.locStart(n) === util.locStart(n.value)
-      var isGetterOrSetter = n.kind === "get" || n.kind === "set"
 
       return concat([
         n.static ? "static " : "",
+        isGetterOrSetter(n) ? n.kind + " " : "",
         variance || "",
         path.call(print, "key"),
         n.optional ? "?" : "",
-        (isFunctionNotation && !isGetterOrSetter) ? "" : ": ",
+        isFunctionNotation(n) ? "" : ": ",
         path.call(print, "value")
       ]);
     case "QualifiedTypeIdentifier":
@@ -1816,23 +2012,32 @@ function genericPrintNoParens(path, options, print, args) {
     case "TypeAlias": {
       if (
         n.type === "DeclareTypeAlias" ||
-        isFlowNodeStartingWithDeclare(n, options)
+        isNodeStartingWithDeclare(n, options)
       ) {
         parts.push("declare ");
       }
+
+      const canBreak = (
+        n.right.type === "StringLiteralTypeAnnotation"
+      );
+
+      const printed = printAssignmentRight(
+        n.right,
+        path.call(print, "right"),
+        canBreak,
+        options
+      );
 
       parts.push(
         "type ",
         path.call(print, "id"),
         path.call(print, "typeParameters"),
         " =",
-        hasLeadingOwnLineComment(options.originalText, n.right)
-          ? indent(concat([hardline, path.call(print, "right")]))
-          : concat([" ", path.call(print, "right")]),
+        printed,
         semi
       );
 
-      return concat(parts);
+      return group(concat(parts));
     }
     case "TypeCastExpression":
       return concat([
@@ -1843,29 +2048,8 @@ function genericPrintNoParens(path, options, print, args) {
         ")"
       ]);
     case "TypeParameterDeclaration":
-    case "TypeParameterInstantiation": {
-      const shouldInline =
-        n.params.length === 1 && n.params[0].type === "ObjectTypeAnnotation";
-
-      if (shouldInline) {
-        return concat(["<", join(", ", path.map(print, "params")), ">"]);
-      }
-
-      return group(
-        concat([
-          "<",
-          indent(
-            concat([
-              softline,
-              join(concat([",", line]), path.map(print, "params"))
-            ])
-          ),
-          ifBreak(shouldPrintComma(options, "all") ? "," : ""),
-          softline,
-          ">"
-        ])
-      );
-    }
+    case "TypeParameterInstantiation":
+      return printTypeParameters(path, options, print, "params");
     case "TypeParameter":
       var variance = getFlowVariance(n, options);
 
@@ -1885,7 +2069,7 @@ function genericPrintNoParens(path, options, print, args) {
       }
 
       if (n["default"]) {
-        parts.push("=", path.call(print, "default"));
+        parts.push(" = ", path.call(print, "default"));
       }
 
       return concat(parts);
@@ -1902,16 +2086,42 @@ function genericPrintNoParens(path, options, print, args) {
     // supported by the pretty-printer.
     case "DeclaredPredicate":
       return concat(["%checks(", path.call(print, "value"), ")"]);
+    case "TSAbstractKeyword":
+      return "abstract";
     case "TSAnyKeyword":
       return "any";
+    case "TSAsyncKeyword":
+      return "async";
     case "TSBooleanKeyword":
       return "boolean";
+    case "TSConstKeyword":
+      return "const";
+    case "TSDeclareKeyword":
+      return "declare"
+    case "TSExportKeyword":
+      return "export";
+    case "TSNeverKeyword":
+      return "never";
     case "TSNumberKeyword":
       return "number";
     case "TSObjectKeyword":
       return "object";
+    case "TSProtectedKeyword":
+      return "protected";
+    case "TSPrivateKeyword":
+      return "private";
+    case "TSPublicKeyword":
+      return "public";
+    case "TSReadonlyKeyword":
+      return "readonly";
+    case "TSSymbolKeyword":
+      return "symbol";
+    case "TSStaticKeyword":
+      return "static";
     case "TSStringKeyword":
       return "string";
+    case "TSUndefinedKeyword":
+      return "undefined";
     case "TSVoidKeyword":
       return "void";
     case "TSAsExpression":
@@ -1923,36 +2133,51 @@ function genericPrintNoParens(path, options, print, args) {
     case "TSArrayType":
       return concat([path.call(print, "elementType"), "[]"]);
     case "TSPropertySignature":
+      var computed = !namedTypes.Identifier.check(n.name) &&
+        !namedTypes.Literal.check(n.name);
+
+      parts.push(printTypeScriptModifiers(path, options, print));
+
+      if (computed) {
+        parts.push("[");
+      }
+
       parts.push(path.call(print, "name"));
-      parts.push(": ")
-      parts.push(path.call(print, "typeAnnotation"));
+
+      if (computed) {
+        parts.push("]");
+      }
+
+      if (n.questionToken && !n.name.optional) {
+        parts.push("?");
+      }
+
+      if (n.typeAnnotation) {
+        parts.push(": ");
+        parts.push(path.call(print, "typeAnnotation"));
+      }
+
+      // This isn't valid semantically, but it's in the AST so we can print it.
+      if (n.initializer) {
+          parts.push(" = ", path.call(print, "initializer"));
+      }
+
+      return concat(parts);
+    case "TSParameterProperty":
+      if (n.accessibility) {
+        parts.push(n.accessibility + " ");
+      }
+      if (n.isReadonly) {
+        parts.push("readonly ");
+      }
+
+      parts.push(path.call(print, "parameter"));
 
       return concat(parts);
     case "TSTypeReference":
-      parts.push(path.call(print, "typeName"))
-      
-      if (n.typeArguments) {
-        parts.push(
-          "<",
-          join(", ", path.map(print, "typeArguments")),
-          ">"
-        )
-      }
-      
-      return concat(parts);
-    case "TSCallSignature":
       return concat([
-        "(",
-        join(", ", path.map(print, "parameters")),
-        "): ",
-        path.call(print, "typeAnnotation")
-      ]);
-    case "TSConstructSignature":
-      return concat([
-        "new (",
-        join(", ", path.map(print, "parameters")),
-        "): ",
-        path.call(print, "typeAnnotation")
+        path.call(print, "typeName"),
+        printTypeParameters(path, options, print, "typeArguments")
       ]);
     case "TSTypeQuery":
       return concat(["typeof ", path.call(print, "exprName")]);
@@ -1960,6 +2185,7 @@ function genericPrintNoParens(path, options, print, args) {
       return concat(["(", path.call(print, "typeAnnotation"), ")"]);
     case "TSIndexSignature":
       return concat([
+        printTypeScriptModifiers(path, options, print),
         "[",
         // This should only contain a single element, however TypeScript parses
         // it using parseDelimitedList that uses commas as delimiter.
@@ -1969,12 +2195,6 @@ function genericPrintNoParens(path, options, print, args) {
       ]);
     case "TSFirstTypeNode":
       return concat([n.parameterName.name, " is ", path.call(print, "typeAnnotation")])
-    case "TSNeverKeyword":
-      return "never";
-    case "TSUndefinedKeyword":
-      return "undefined";
-    case "TSSymbolKeyword":
-      return "symbol";
     case "TSNonNullExpression":
       return concat([path.call(print, "expression"), "!"]);
     case "TSThisType":
@@ -1988,40 +2208,218 @@ function genericPrintNoParens(path, options, print, args) {
         path.call(print, "indexType"),
         "]"
       ])
+    case "TSConstructSignature":
     case "TSConstructorType":
-      return concat([
-        "new(",
+    case "TSCallSignature":
+      if (n.type !== "TSCallSignature") {
+        parts.push("new ");
+      }
+      var isType = n.type === "TSConstructorType";
+      parts.push(
+        printTypeParameters(path, options, print, "typeParameters"),
+        "(",
         join(", ", path.map(print, "parameters")),
-        ") => ",
-        path.call(print, "typeAnnotation"),
-      ])
+        ")"
+      );
+      if (n.typeAnnotation) {
+        parts.push(
+          isType ? " => " : ": ",
+          path.call(print, "typeAnnotation")
+        );
+      }
+      return concat(parts);
     case "TSTypeOperator":
       return concat([
         "keyof ",
         path.call(print, "typeAnnotation")
       ])
     case "TSMappedType":
-      return concat([
-        "{",
-        options.bracketSpacing ? line : softline,
-        "[",
-        path.call(print, "typeParameter"),
-        "]: ",
-        path.call(print, "typeAnnotation"),
-        options.bracketSpacing ? line : softline,
-        "}"
-      ])
+      return group(
+        concat([
+          "{",
+          indent(
+            concat([
+              options.bracketSpacing ? line : softline,
+              n.readonlyToken
+                ? concat([path.call(print, "readonlyToken"), " "])
+                : "",
+              printTypeScriptModifiers(path, options, print),
+              "[",
+              path.call(print, "typeParameter"),
+              "]",
+              n.questionToken ? "?" : "",
+              ": ",
+              path.call(print, "typeAnnotation")
+            ])
+          ),
+          comments.printDanglingComments(
+            path,
+            options,
+            /* sameIndent */ true
+          ),
+          options.bracketSpacing ? line : softline,
+          "}"
+        ])
+      );
     case "TSTypeParameter":
-      parts.push(path.call(print, "name"))
-      
+      parts.push(path.call(print, "name"));
+
       if (n.constraint) {
         parts.push(
           " in ",
           path.call(print, "constraint")
+        );
+      }
+
+      return concat(parts)
+    case "TSMethodSignature":
+      parts.push(
+        path.call(print, 'name'),
+        printTypeParameters(path, options, print, "typeParameters"),
+        printFunctionParams(path, print, options)
+      )
+
+      if (n.typeAnnotation) {
+        parts.push(
+          ": ",
+          path.call(print, "typeAnnotation")
         )
       }
-      
       return concat(parts)
+    case "TSNamespaceExportDeclaration":
+      if (n.declaration) {
+        parts.push(
+          "export ",
+          path.call(print, "declaration")
+        )
+      } else {
+        parts.push(
+          "export as namespace ",
+          path.call(print, "name")
+        )
+
+        if (options.semi) {
+          parts.push(";")
+        }
+      }
+
+      return group(concat(parts));
+    case "TSEnumDeclaration":
+      if (n.modifiers) {
+        parts.push(printTypeScriptModifiers(path, options, print));
+      }
+
+      parts.push(
+        "enum ",
+        path.call(print, "name"),
+        " "
+      )
+
+      if (n.members.length === 0) {
+        parts.push(
+          group(
+            concat([
+              "{",
+              comments.printDanglingComments(path, options),
+              softline,
+              "}"
+            ])
+          )
+        );
+      } else {
+        parts.push(
+          group(
+            concat([
+              "{",
+              options.bracketSpacing ? line : softline,
+              indent(
+                concat([
+                  softline,
+                  printArrayItems(path, options, "members", print)
+                ])
+              ),
+              comments.printDanglingComments(
+                path,
+                options,
+                /* sameIndent */ true
+              ),
+              softline,
+              options.bracketSpacing ? line : softline,
+              "}"
+            ])
+          )
+        );
+      }
+
+      return concat(parts);
+    case "TSEnumMember":
+      parts.push(path.call(print, "name"));
+      if (n.initializer) {
+        parts.push(" = ", path.call(print, "initializer"));
+      }
+      return concat(parts);
+    case "TSImportEqualsDeclaration":
+      parts.push(
+        softline,
+        printTypeScriptModifiers(path, options, print),
+        "import ",
+        path.call(print, "name"),
+        " = ",
+        path.call(print, "moduleReference")
+      )
+
+      if (options.semi) {
+        parts.push(";")
+      }
+
+      return group(concat(parts));
+    case "TSExternalModuleReference":
+      return concat([
+        "require(",
+        path.call(print, "expression"),
+        ")"
+      ])
+    case "TSModuleDeclaration":
+      var parent = path.getParentNode();
+      var isExternalModule = namedTypes.Literal.check(n.name);
+      var parentIsDeclaration = parent.type === "TSModuleDeclaration";
+      var bodyIsDeclaration = n.body.type === "TSModuleDeclaration";
+
+      if (parentIsDeclaration) {
+        parts.push(".");
+      } else {
+        parts.push(printTypeScriptModifiers(path, options, print));
+
+        // Global declaration looks like this:
+        // declare global { ... }
+        var isGlobalDeclaration = n.name.type === "Identifier" &&
+          n.name.name === "global" &&
+            n.modifiers.some(modifier => modifier.type === "TSDeclareKeyword");
+
+        if (!isGlobalDeclaration) {
+          parts.push(isExternalModule ? "module " : "namespace ");
+        }
+      }
+
+      parts.push(path.call(print, "name"));
+
+      if (bodyIsDeclaration) {
+        parts.push(path.call(print, "body"));
+      } else {
+        parts.push(
+          " {",
+          indent(concat([line, group(path.call(print, "body"))])),
+          line,
+          "}"
+        );
+      }
+
+      return concat(parts);
+
+    case "TSModuleBlock":
+      return path.call(function(bodyPath) {
+        return printStatementSequence(bodyPath, options, print);
+      }, "body");
     // TODO
     case "ClassHeritage":
     // TODO
@@ -2061,7 +2459,6 @@ function genericPrintNoParens(path, options, print, args) {
     case "XMLComment":
     case "XMLProcessingInstruction":
     default:
-      debugger;
       throw new Error("unknown type: " + JSON.stringify(n.type));
   }
 }
@@ -2107,7 +2504,6 @@ function printStatementSequence(path, options, print) {
       parts.push(stmtPrinted);
     }
 
-
     if (!options.semi && isClass) {
       if (classPropMayCauseASIProblems(stmtPath)) {
         parts.push(";");
@@ -2137,14 +2533,11 @@ function printPropertyKey(path, options, print) {
     (key.type === "StringLiteral" ||
       (key.type === "Literal" && typeof key.value === "string")) &&
     isIdentifierName(key.value) &&
-    !node.computed &&
-    // There's a bug in the flow parser where it throws if there are
-    // unquoted unicode literals as keys. Let's quote them for now.
-    (options.parser !== "flow" || key.value.match(/[a-zA-Z0-9$_]/))
+    !node.computed
   ) {
     // 'a' -> a
     return path.call(
-      keyPath => comments.printComments(keyPath, p => key.value, options),
+      keyPath => comments.printComments(keyPath, () => key.value, options),
       "key"
     );
   }
@@ -2153,6 +2546,7 @@ function printPropertyKey(path, options, print) {
 
 function printMethod(path, options, print) {
   var node = path.getNode();
+  var semi = options.semi ? ";" : "";
   var kind = node.kind;
   var parts = [];
 
@@ -2184,18 +2578,20 @@ function printMethod(path, options, print) {
 
   parts.push(
     key,
-    path.call(print, "value", "typeParameters"),
-    group(
-      concat([
-        path.call(function(valuePath) {
-          return printFunctionParams(valuePath, print, options);
-        }, "value"),
-        path.call(p => printReturnType(p, print), "value")
-      ])
-    ),
-    " ",
-    path.call(print, "value", "body")
+    concat(path.call(valuePath => [
+      printFunctionTypeParameters(valuePath, options, print),
+      group(concat([
+        printFunctionParams(valuePath, print, options),
+        printReturnType(valuePath, print)
+      ]))
+    ], "value"))
   );
+
+  if (!node.value.body || node.value.body.length === 0) {
+    parts.push(semi);
+  } else {
+    parts.push(" ", path.call(print, "value", "body"));
+  }
 
   return concat(parts);
 }
@@ -2245,7 +2641,7 @@ function shouldGroupFirstArg(args) {
 
 function printArgumentsList(path, options, print) {
   var printed = path.map(print, "arguments");
-
+  var n = path.getValue();
   if (printed.length === 0) {
     return concat([
       "(",
@@ -2332,10 +2728,24 @@ function printArgumentsList(path, options, print) {
   );
 }
 
+function printFunctionTypeParameters(path, options, print) {
+  const fun = path.getValue();
+  
+  if (fun.typeParameters) {
+    return path.call(print, "typeParameters");
+  } else {
+    return "";
+  }
+}
+
 function printFunctionParams(path, print, options, expandArg) {
   var fun = path.getValue();
   // namedTypes.Function.assert(fun);
-  var paramsField = fun.type === "TSFunctionType" ? "parameters" : "params";
+  var paramsField = (fun.type === "TSFunctionType" ||
+    fun.type === "TSMethodSignature")
+      ? "parameters"
+      : "params";
+
   var printed = path.map(print, paramsField);
 
   if (fun.defaults) {
@@ -2384,15 +2794,7 @@ function printFunctionParams(path, print, options, expandArg) {
   //   b,
   //   c
   // }) {}
-  if (
-    fun.params &&
-    fun.params.length === 1 &&
-    !fun.params[0].comments &&
-    (fun.params[0].type === "ObjectPattern" ||
-      (fun.params[0].type === "FunctionTypeParam" &&
-        fun.params[0].typeAnnotation.type === "ObjectTypeAnnotation")) &&
-    !fun.rest
-  ) {
+  if (shouldHugArguments(fun)) {
     return concat(["(", join(", ", printed), ")"]);
   }
 
@@ -2427,19 +2829,22 @@ function printFunctionParams(path, print, options, expandArg) {
     flowTypeAnnotations.indexOf(fun[paramsField][0].typeAnnotation.type) !== -1 &&
     !fun.rest;
 
+  if (isFlowShorthandWithOneArg) {
+    return concat(printed);
+  }
+
   const canHaveTrailingComma =
-    !isFlowShorthandWithOneArg &&
     !(lastParam && lastParam.type === "RestElement") &&
     !fun.rest;
 
   return concat([
-    isFlowShorthandWithOneArg ? "" : "(",
+    "(",
     indent(concat([softline, join(concat([",", line]), printed)])),
     ifBreak(
       canHaveTrailingComma && shouldPrintComma(options, "all") ? "," : ""
     ),
     softline,
-    isFlowShorthandWithOneArg ? "" : ")"
+    ")"
   ]);
 }
 
@@ -2449,7 +2854,7 @@ function canPrintParamsWithoutParens(node) {
     !node.rest &&
     node.params[0].type === "Identifier" &&
     !node.params[0].typeAnnotation &&
-    !node.params[0].comments &&
+    !util.hasBlockComments(node.params[0]) &&
     !node.params[0].optional &&
     !node.predicate &&
     !node.returnType
@@ -2460,18 +2865,21 @@ function printFunctionDeclaration(path, print, options) {
   var n = path.getValue();
   var parts = [];
 
-  if (n.async) parts.push("async ");
+  if (n.async) {
+    parts.push("async ");
+  }
 
   parts.push("function");
 
-  if (n.generator) parts.push("*");
-
+  if (n.generator) {
+    parts.push("*");
+  }
   if (n.id) {
     parts.push(" ", path.call(print, "id"));
   }
 
   parts.push(
-    path.call(print, "typeParameters"),
+    printFunctionTypeParameters(path, options, print),
     group(
       concat([
         printFunctionParams(path, print, options),
@@ -2489,10 +2897,12 @@ function printObjectMethod(path, options, print) {
   var objMethod = path.getValue();
   var parts = [];
 
-  if (objMethod.async) parts.push("async ");
-
-  if (objMethod.generator) parts.push("*");
-
+  if (objMethod.async) {
+    parts.push("async ");
+  }
+  if (objMethod.generator) {
+    parts.push("*");
+  }
   if (
     objMethod.method || objMethod.kind === "get" || objMethod.kind === "set"
   ) {
@@ -2507,11 +2917,8 @@ function printObjectMethod(path, options, print) {
     parts.push(key);
   }
 
-  if (objMethod.typeParameters) {
-    parts.push(path.call(print, "typeParameters"));
-  }
-
   parts.push(
+    printFunctionTypeParameters(path, options, print),
     group(
       concat([
         printFunctionParams(path, print, options),
@@ -2531,7 +2938,7 @@ function printReturnType(path, print) {
 
   // prepend colon to TypeScript type annotation
   if (n.returnType && n.returnType.typeAnnotation) {
-    parts.unshift(": ")
+    parts.unshift(": ");
   }
 
   if (n.predicate) {
@@ -2541,14 +2948,6 @@ function printReturnType(path, print) {
   }
 
   return concat(parts);
-}
-
-function typeIsFunction(type) {
-  return (
-    type === "FunctionExpression" ||
-    type === "ArrowFunctionExpression" ||
-    type === "NewExpression"
-  );
 }
 
 function printExportDeclaration(path, options, print) {
@@ -2658,7 +3057,7 @@ function printFlowDeclaration(path, parts) {
   return concat(parts);
 }
 
-function getFlowVariance(path, options) {
+function getFlowVariance(path) {
   if (!path.variance) {
     return null;
   }
@@ -2680,9 +3079,61 @@ function getFlowVariance(path, options) {
   }
 }
 
+function printTypeScriptModifiers(path, options, print) {
+  const n = path.getValue();
+  if (!n.modifiers || !n.modifiers.length) {
+    return "";
+  }
+  return concat([
+    join(" ", path.map(print, "modifiers")),
+    " "
+  ]);
+}
+
+function printTypeParameters(path, options, print, paramsKey) {
+  const n = path.getValue();
+
+  if (!n[paramsKey]) {
+    return "";
+  }
+
+  const shouldInline =
+    n[paramsKey].length === 1 &&
+    (n[paramsKey][0].type === "ObjectTypeAnnotation" ||
+      n[paramsKey][0].type === "NullableTypeAnnotation");
+
+  if (shouldInline) {
+    return concat(["<", join(", ", path.map(print, paramsKey)), ">"]);
+  }
+
+  return group(
+    concat([
+      "<",
+      indent(
+        concat([
+          softline,
+          join(concat([",", line]), path.map(print, paramsKey))
+        ])
+      ),
+      ifBreak(shouldPrintComma(options, "all") ? "," : ""),
+      softline,
+      ">"
+    ])
+  );
+}
+
 function printClass(path, options, print) {
   const n = path.getValue();
-  const parts = ["class"];
+  const parts = [];
+
+  if (n.accessibility) {
+    parts.push(n.accessibility + " ");
+  }
+  if (n.type === "TSAbstractClassDeclaration") {
+    parts.push("abstract ");
+  }
+
+  parts.push("class");
 
   if (n.id) {
     parts.push(" ", path.call(print, "id"), path.call(print, "typeParameters"));
@@ -2721,14 +3172,25 @@ function printMemberLookup(path, options, print) {
   const property = path.call(print, "property");
   const n = path.getValue();
 
-  return concat(
-    n.computed
-      ? [
-          "[",
-          group(concat([indent(concat([softline, property])), softline])),
-          "]"
-        ]
-      : [".", property]
+  if (!n.computed) {
+    return concat([".", property]);
+  }
+
+  if (
+    !n.property ||
+    (n.property.type === "Literal" && typeof n.property.value === "number") ||
+      n.property.type === "NumericLiteral"
+  ) {
+    return concat(["[", property, "]"]);
+  }
+
+  return group(
+    concat([
+      "[",
+      indent(concat([softline, property])),
+      softline,
+      "]"
+    ])
   );
 }
 
@@ -2760,7 +3222,10 @@ function printMemberChain(path, options, print) {
         node: node,
         printed: comments.printComments(
           path,
-          p => printArgumentsList(path, options, print),
+          () => concat([
+              printFunctionTypeParameters(path, options, print),
+              printArgumentsList(path, options, print)
+          ]),
           options
         )
       });
@@ -2770,7 +3235,7 @@ function printMemberChain(path, options, print) {
         node: node,
         printed: comments.printComments(
           path,
-          p => printMemberLookup(path, options, print),
+          () => printMemberLookup(path, options, print),
           options
         )
       });
@@ -2787,7 +3252,10 @@ function printMemberChain(path, options, print) {
   // if handled inside of the recursive call.
   printedNodes.unshift({
     node: path.getValue(),
-    printed: printArgumentsList(path, options, print)
+    printed: concat([
+        printFunctionTypeParameters(path, options, print),
+        printArgumentsList(path, options, print)
+    ])
   });
   path.call(callee => rec(callee), "callee");
 
@@ -2940,8 +3408,12 @@ function printMemberChain(path, options, print) {
 }
 
 function isEmptyJSXElement(node) {
-  if (node.children.length === 0) return true;
-  if (node.children.length > 1) return false;
+  if (node.children.length === 0) {
+    return true;
+  }
+  if (node.children.length > 1) {
+    return false;
+  }
 
   // if there is one child but it's just a newline, treat as empty
   const value = node.children[0].value;
@@ -2972,20 +3444,12 @@ function printJSXChildren(path, options, print, jsxWhitespace) {
     const isLiteral = namedTypes.Literal.check(child);
 
     if (isLiteral && typeof child.value === "string") {
-      // There's a bug in the flow parser where it doesn't unescape the
-      // value field. To workaround this, we can use rawValue which is
-      // correctly escaped (since it parsed).
-      // We really want to use value and re-escape it ourself when possible
-      // though.
-      const partiallyEscapedValue = options.parser === "flow"
-        ? child.raw
-        : util.htmlEscapeInsideAngleBracket(child.value);
-      const value = partiallyEscapedValue.replace(/\u00a0/g, "&nbsp;");
+      const value = child.raw || child.extra.raw;
 
       if (/\S/.test(value)) {
         // treat each line of text as its own entity
-        value.split(/(\r?\n\s*)/).forEach(line => {
-          const newlines = line.match(/\n/g);
+        value.split(/(\r?\n\s*)/).forEach(textLine => {
+          const newlines = textLine.match(/\n/g);
           if (newlines) {
             children.push(hardline);
 
@@ -2996,27 +3460,38 @@ function printJSXChildren(path, options, print, jsxWhitespace) {
             return;
           }
 
-          const beginSpace = /^\s+/.test(line);
+          if (textLine.length === 0) {
+            return;
+          }
+
+          const beginSpace = /^\s+/.test(textLine);
           if (beginSpace) {
             children.push(jsxWhitespace);
+          } else {
             children.push(softline);
           }
 
-          const stripped = line.replace(/^\s+|\s+$/g, "");
+          const stripped = textLine.replace(/^\s+|\s+$/g, "");
           if (stripped) {
-            children.push(stripped);
+
+            // Split text into words separated by "line"s.
+            stripped.split(/(\s+)/).forEach(word => {
+              const space = /\s+/.test(word);
+              if (space) {
+                children.push(line);
+              } else {
+                children.push(word);
+              }
+            });
           }
 
-          const endSpace = /\s+$/.test(line);
+          const endSpace = /\s+$/.test(textLine);
           if (endSpace) {
-            children.push(softline);
             children.push(jsxWhitespace);
+          } else {
+            children.push(softline);
           }
         });
-
-        if (!isLineNext(util.getLast(children))) {
-          children.push(softline);
-        }
       } else if (/\n/.test(value)) {
         children.push(hardline);
 
@@ -3025,17 +3500,26 @@ function printJSXChildren(path, options, print, jsxWhitespace) {
           children.push(hardline);
         }
       } else if (/\s/.test(value)) {
-        // whitespace-only without newlines,
-        // eg; a single space separating two elements
-        children.push(jsxWhitespace);
-        children.push(softline);
+        // whitespace(s)-only without newlines,
+        // eg; one or more spaces separating two elements
+        for (let i = 0; i < value.length; ++i) {
+          children.push(jsxWhitespace);
+          // Because fill expects alternating content and whitespace parts
+          // we need to include an empty content part between each JSX
+          // whitespace.
+          if (i + 1 < value.length) {
+            children.push('');
+          }
+        }
       }
     } else {
       children.push(print(childPath));
 
-      // add a line unless it's followed by a JSX newline
+      // add a softline where we have two adjacent elements that are not
+      // literals
       let next = n.children[i + 1];
-      if (!(next && /^\s*\n/.test(next.value))) {
+      const followedByJSXElement = next && !namedTypes.Literal.check(next);
+      if (followedByJSXElement) {
         children.push(softline);
       }
     }
@@ -3092,9 +3576,9 @@ function printJSXElement(path, options, print) {
   // Record any breaks. Should never go from true to false, only false to true.
   let forcedBreak = willBreak(openingLines);
 
-  const jsxWhitespace = options.singleQuote
-    ? ifBreak("{' '}", " ")
-    : ifBreak('{" "}', " ");
+  const rawJsxWhitespace = options.singleQuote ? "{' '}" : '{" "}';
+  const jsxWhitespace = ifBreak(concat([softline, rawJsxWhitespace, softline]), " ")
+
   const children = printJSXChildren(path, options, print, jsxWhitespace);
 
   // Trim trailing lines, recording if there was a hardline
@@ -3125,56 +3609,37 @@ function printJSXElement(path, options, print) {
     children.unshift(hardline);
   }
 
-  // Group by line, recording if there was a hardline.
-  let groups = [[]]; // Initialize the first line's group
+  // Tweak how we format children if outputting this element over multiple lines.
+  // Also detect whether we will force this element to output over multiple lines.
+  let multilineChildren = [];
   children.forEach((child, i) => {
-    // leading and trailing JSX whitespace don't go into a group
+
+    // Ensure that we display leading, trailing, and solitary whitespace as
+    // `{" "}` when outputting this element over multiple lines.
     if (child === jsxWhitespace) {
-      if (i === 0) {
-        groups.unshift(child);
+      if (children.length === 1) {
+        multilineChildren.push(rawJsxWhitespace);
+        return;
+      } else if (i === 0) {
+        multilineChildren.push(concat([rawJsxWhitespace, hardline]));
         return;
       } else if (i === children.length - 1) {
-        groups.push(child);
+        multilineChildren.push(concat([hardline, rawJsxWhitespace]));
         return;
       }
     }
 
-    let prev = children[i - 1];
-    if (prev && willBreak(prev)) {
+    multilineChildren.push(child);
+
+    if (willBreak(child)) {
       forcedBreak = true;
-
-      // On a new line, so create a new group and put this element in it.
-      groups.push([child]);
-    } else {
-      // Not on a newline, so add this element to the current group.
-      util.getLast(groups).push(child);
-    }
-
-    // Ensure we record hardline of last element.
-    if (!forcedBreak && i === children.length - 1) {
-      if (willBreak(child)) forcedBreak = true;
     }
   });
-
-  const childrenGroupedByLine = [
-    hardline,
-    // Conditional groups suppress break propagation; we want to output
-    // hard lines without breaking up the entire jsx element.
-    // Note that leading and trailing JSX Whitespace don't go into a group.
-    concat(
-      groups.map(
-        contents =>
-          (Array.isArray(contents)
-            ? conditionalGroup([concat(contents)])
-            : contents)
-      )
-    )
-  ];
 
   const multiLineElem = group(
     concat([
       openingLines,
-      indent(group(concat(childrenGroupedByLine), { shouldBreak: true })),
+      indent(concat([hardline, fill(multilineChildren)])),
       hardline,
       closingLines
     ])
@@ -3185,14 +3650,16 @@ function printJSXElement(path, options, print) {
   }
 
   return conditionalGroup([
-    group(concat([openingLines, concat(children), closingLines])),
+    group(concat([openingLines, fill(children), closingLines])),
     multiLineElem
   ]);
 }
 
-function maybeWrapJSXElementInParens(path, elem, options) {
+function maybeWrapJSXElementInParens(path, elem) {
   const parent = path.getParentNode();
-  if (!parent) return elem;
+  if (!parent) {
+    return elem;
+  }
 
   const NO_WRAP_PARENTS = {
     ArrayExpression: true,
@@ -3222,11 +3689,19 @@ function isBinaryish(node) {
 }
 
 function shouldInlineLogicalExpression(node) {
-  return (
-    node.type === "LogicalExpression" &&
-    (node.right.type === "ObjectExpression" ||
-      node.right.type === "ArrayExpression")
-  );
+  if (node.type !== "LogicalExpression") {
+    return false;
+  }
+
+  if (node.right.type === "ObjectExpression" && node.right.properties.length !== 0) {
+    return true;
+  }
+
+  if (node.right.type === "ArrayExpression" && node.right.elements.length !== 0) {
+    return true;
+  }
+
+  return false;
 }
 
 // For binary expressions to be consistent, we need to group
@@ -3295,7 +3770,7 @@ function printBinaryishExpressions(path, print, options, isNested, isInsideParen
     // the other ones since we don't call the normal print on BinaryExpression,
     // only for the left and right parts
     if (isNested && node.comments) {
-      parts = comments.printComments(path, p => concat(parts), options);
+      parts = comments.printComments(path, () => concat(parts), options);
     }
   } else {
     // Our stopping case. Simply print the node normally.
@@ -3303,6 +3778,18 @@ function printBinaryishExpressions(path, print, options, isNested, isInsideParen
   }
 
   return parts;
+}
+
+function printAssignmentRight(rightNode, printedRight, canBreak, options) {
+  if (hasLeadingOwnLineComment(options.originalText, rightNode)) {
+    return indent(concat([hardline, printedRight]));
+  }
+
+  if (canBreak) {
+    return indent(concat([line, printedRight]));
+  }
+
+  return concat([" ", printedRight]);
 }
 
 function printAssignment(
@@ -3317,20 +3804,20 @@ function printAssignment(
     return printedLeft;
   }
 
-  let printed;
-  if (hasLeadingOwnLineComment(options.originalText, rightNode)) {
-    printed = indent(concat([hardline, printedRight]));
-  } else if (
+  const canBreak = (
     (isBinaryish(rightNode) && !shouldInlineLogicalExpression(rightNode)) ||
     (leftNode.type === "Identifier" || leftNode.type === "MemberExpression") &&
       (rightNode.type === "StringLiteral" ||
         (rightNode.type === "Literal" && typeof rightNode.value === "string") ||
         isMemberExpressionChain(rightNode))
-  ) {
-    printed = indent(concat([line, printedRight]));
-  } else {
-    printed = concat([" ", printedRight]);
-  }
+  );
+
+  const printed = printAssignmentRight(
+    rightNode,
+    printedRight,
+    canBreak,
+    options
+  );
 
   return group(concat([printedLeft, " ", operator, printed]));
 }
@@ -3347,34 +3834,9 @@ function adjustClause(node, clause, forceSpace) {
   return indent(concat([line, clause]));
 }
 
-function shouldTypeScriptTypeAvoidColon(path) {
-  // As the special TS nodes isn't returned by the node helpers,
-  // we use the stack directly to get the parent node.
-  const parent = path.stack[path.stack.length - 3];
-
-  switch (parent.type) {
-    case "TSFunctionType":
-    case "TSIndexSignature":
-    case "TSParenthesizedType":
-    case "TSCallSignature":
-    case "TSConstructSignature":
-    case "TSAsExpression":
-      return true;
-    default:
-      return false;
-  }
-}
-
-function nodeStr(node, options) {
+function nodeStr(node, options, isFlowDirectiveLiteral) {
   const str = node.value;
   isString.assert(str);
-
-  // Workaround a bug in the Javascript version of the flow parser where
-  // astral unicode characters like \uD801\uDC28 are incorrectly parsed as
-  // a sequence of \uFFFD.
-  if (options.parser === "flow" && str.indexOf("\ufffd") !== -1) {
-    return node.raw;
-  }
 
   const raw = node.extra ? node.extra.raw : node.raw;
   // `rawContent` is the string exactly like it appeared in the input source
@@ -3388,20 +3850,42 @@ function nodeStr(node, options) {
   const alternate = preferred === single ? double : single;
 
   let shouldUseAlternateQuote = false;
+  const isDirectiveLiteral =
+    isFlowDirectiveLiteral || node.type === "DirectiveLiteral";
+  let canChangeDirectiveQuotes = false;
 
   // If `rawContent` contains at least one of the quote preferred for enclosing
   // the string, we might want to enclose with the alternate quote instead, to
   // minimize the number of escaped quotes.
-  if (rawContent.includes(preferred.quote)) {
+  // Also check for the alternate quote, to determine if we're allowed to swap
+  // the quotes on a DirectiveLiteral.
+  if (
+    rawContent.includes(preferred.quote) ||
+    rawContent.includes(alternate.quote)
+  ) {
     const numPreferredQuotes = (rawContent.match(preferred.regex) || []).length;
     const numAlternateQuotes = (rawContent.match(alternate.regex) || []).length;
 
     shouldUseAlternateQuote = numPreferredQuotes > numAlternateQuotes;
+  } else {
+    canChangeDirectiveQuotes = true;
   }
 
   const enclosingQuote = shouldUseAlternateQuote
     ? alternate.quote
     : preferred.quote;
+
+  // Directives are exact code unit sequences, which means that you can't
+  // change the escape sequences they use.
+  // See https://github.com/prettier/prettier/issues/1555
+  // and https://tc39.github.io/ecma262/#directive-prologue
+  if (isDirectiveLiteral) {
+    if (canChangeDirectiveQuotes) {
+      return enclosingQuote + rawContent + enclosingQuote;
+    } else {
+      return raw;
+    }
+  }
 
   // It might sound unnecessary to use `makeString` even if `node.raw` already
   // is enclosed with `enclosingQuote`, but it isn't. `node.raw` could contain
@@ -3433,8 +3917,15 @@ function makeString(rawContent, enclosingQuote) {
       return "\\" + quote;
     }
 
-    // Otherwise return the escape or unescaped quote as-is.
-    return match;
+    if (quote) {
+      return quote;
+    }
+
+    // Unescape any unnecessarily escaped character.
+    // Adapted from https://github.com/eslint/eslint/blob/de0b4ad7bd820ade41b1f606008bea68683dc11a/lib/rules/no-useless-escape.js#L27
+    return /^[^\\nrvtbfux\r\n\u2028\u2029"'0-7]$/.test(escaped)
+      ? escaped
+      : "\\" + escaped;
   });
 
   return enclosingQuote + newContent + enclosingQuote;
@@ -3460,15 +3951,11 @@ function printNumber(rawNumber) {
   );
 }
 
-function isFirstStatement(path) {
-  const parent = path.getParentNode();
-  const node = path.getValue();
-  const body = parent.body;
-  return body && body[0] === node;
-}
-
 function isLastStatement(path) {
   const parent = path.getParentNode();
+  if (!parent) {
+    return true;
+  }
   const node = path.getValue();
   const body = parent.body.filter(stmt => stmt.type !== "EmptyStatement");
   return body && body[body.length - 1] === node;
@@ -3492,7 +3979,8 @@ function hasNakedLeftSide(node) {
     node.type === "CallExpression" ||
     node.type === "MemberExpression" ||
     node.type === "SequenceExpression" ||
-    node.type === "TaggedTemplateExpression"
+    node.type === "TaggedTemplateExpression" ||
+    (node.type === "UpdateExpression" && !node.prefix)
   );
 }
 
@@ -3500,7 +3988,7 @@ function getLeftSide(node) {
   if (node.expressions) {
     return node.expressions[0];
   }
-  return node.left || node.test || node.callee || node.object || node.tag;
+  return node.left || node.test || node.callee || node.object || node.tag || node.argument;
 }
 
 function exprNeedsASIProtection(node) {
@@ -3520,6 +4008,7 @@ function exprNeedsASIProtection(node) {
     node.type === "TemplateLiteral" ||
     node.type === "TemplateElement" ||
     node.type === "JSXElement" ||
+    node.type === "BindExpression" ||
     node.type === "RegExpLiteral" ||
     (node.type === "Literal" && node.pattern) ||
     (node.type === "Literal" && node.regex);
@@ -3536,7 +4025,9 @@ function exprNeedsASIProtection(node) {
 }
 
 function stmtNeedsASIProtection(path) {
-  if (!path) return false;
+  if (!path) {
+    return false;
+  }
   const node = path.getNode();
 
   if (node.type !== "ExpressionStatement") {
@@ -3566,14 +4057,18 @@ function classPropMayCauseASIProblems(path) {
 }
 
 function classChildNeedsASIProtection(node) {
-  if (!node) return;
+  if (!node) {
+    return;
+  }
 
-  let isAsync, isGenerator;
   switch (node.type) {
     case "ClassProperty":
+    case "TSAbstractClassProperty":
       return node.computed;
     // flow
     case "MethodDefinition":
+    // typescript
+    case "TSAbstractMethodDefinition":
     // babylon
     case "ClassMethod": {
       const isAsync = node.value ? node.value.async : node.async;
@@ -3634,8 +4129,22 @@ function isObjectTypePropertyAFunction(node) {
     node.type === "ObjectTypeProperty" &&
     node.value.type === "FunctionTypeAnnotation" &&
     !node.static &&
-    util.locStart(node.key) !== util.locStart(node.value)
+    !isFunctionNotation(node)
   );
+}
+
+// TODO: This is a bad hack and we need a better way to distinguish between
+// arrow functions and otherwise
+function isFunctionNotation(node) {
+  return isGetterOrSetter(node) || sameLocStart(node, node.value);
+}
+
+function isGetterOrSetter(node) {
+  return node.kind === "get" || node.kind === "set";
+}
+
+function sameLocStart(nodeA, nodeB) {
+  return util.locStart(nodeA) === util.locStart(nodeB);
 }
 
 // Hack to differentiate between the following two which have the same ast
@@ -3646,18 +4155,53 @@ function isTypeAnnotationAFunction(node) {
     node.type === "TypeAnnotation" &&
     node.typeAnnotation.type === "FunctionTypeAnnotation" &&
     !node.static &&
-    util.locStart(node) !== util.locStart(node.typeAnnotation)
+    !sameLocStart(node, node.typeAnnotation)
   );
 }
 
-function isFlowNodeStartingWithDeclare(node, options) {
-  if (options.parser !== "flow") {
+function isNodeStartingWithDeclare(node, options) {
+  if (!(options.parser === "flow" || options.parser === "typescript")) {
     return false;
   }
+  return (
+    options.originalText.slice(0, util.locStart(node)).match(/declare\s*$/) ||
+    options.originalText
+      .slice(node.range[0], node.range[1])
+      .startsWith("declare ")
+  );
+}
 
-  return options.originalText
-    .slice(0, util.locStart(node))
-    .match(/declare\s*$/);
+function shouldHugArguments(fun) {
+  return (
+    fun &&
+    fun.params &&
+    fun.params.length === 1 &&
+    !fun.params[0].comments &&
+    (fun.params[0].type === "ObjectPattern" ||
+      (fun.params[0].type === "Identifier" &&
+        fun.params[0].typeAnnotation &&
+        fun.params[0].typeAnnotation.type === "TypeAnnotation" &&
+        fun.params[0].typeAnnotation.typeAnnotation.type === "ObjectTypeAnnotation") ||
+      fun.params[0].type === "FunctionTypeParam" &&
+        fun.params[0].typeAnnotation.type === "ObjectTypeAnnotation") &&
+    !fun.rest
+  );
+}
+
+function templateLiteralHasNewLines(template) {
+  return template.quasis.some(quasi => quasi.value.raw.includes('\n'));
+}
+
+function isTemplateOnItsOwnLine(n, text) {
+  return (
+    (n.type === "TemplateLiteral" && templateLiteralHasNewLines(n) ||
+    n.type === "TaggedTemplateExpression" && templateLiteralHasNewLines(n.quasi)) &&
+    !util.hasNewline(
+      text,
+      util.locStart(n),
+      {backwards: true}
+    )
+  );
 }
 
 function printArrayItems(path, options, printPath, print) {
@@ -3678,6 +4222,11 @@ function printArrayItems(path, options, printPath, print) {
   }, printPath);
 
   return concat(printedElements);
+}
+
+function hasDanglingComments(node) {
+  return node.comments &&
+    node.comments.some(comment => !comment.leading && !comment.trailing);
 }
 
 function removeLines(doc) {
